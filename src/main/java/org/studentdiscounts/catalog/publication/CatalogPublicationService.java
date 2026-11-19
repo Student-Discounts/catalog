@@ -29,16 +29,22 @@ public class CatalogPublicationService {
   private final NamedParameterJdbcTemplate jdbc;
   private final ObjectMapper json;
   private final Clock clock;
+  private final org.studentdiscounts.catalog.events.CatalogEvents events;
 
   public CatalogPublicationService(
-      CatalogRepository catalog, NamedParameterJdbcTemplate jdbc, ObjectMapper json, Clock clock) {
+      CatalogRepository catalog,
+      NamedParameterJdbcTemplate jdbc,
+      ObjectMapper json,
+      Clock clock,
+      org.studentdiscounts.catalog.events.CatalogEvents events) {
     this.catalog = catalog;
     this.jdbc = jdbc;
     this.json = json;
     this.clock = clock;
+    this.events = events;
   }
 
-  @Transactional
+  @Transactional(propagation = org.springframework.transaction.annotation.Propagation.NESTED)
   public PublicationResult publish(ReviewedSubmission reviewed) {
     String hash = fingerprint(reviewed);
     jdbc.update(
@@ -128,6 +134,7 @@ public class CatalogPublicationService {
             Timestamp.from(now),
             "version",
             reviewed.versionId()));
+    events.record(place.id(), ids);
     saveOutbox(reviewed, ids, now);
     return new PublicationResult(place.id(), ids, now);
   }

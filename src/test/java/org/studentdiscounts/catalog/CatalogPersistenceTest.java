@@ -28,7 +28,9 @@ import org.testcontainers.utility.DockerImageName;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+    webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+    properties = {"catalog.expiration.enabled=false", "catalog.bootstrap.enabled=false"})
 class CatalogPersistenceTest {
   static final PostgreSQLContainer DATABASE =
       new PostgreSQLContainer(
@@ -71,7 +73,7 @@ class CatalogPersistenceTest {
     jdbc.getJdbcTemplate()
         .execute(
             "TRUNCATE"
-                + " catalog_outbox,catalog_offer_snapshots,catalog_publications,offer_schedule,offers,places,categories"
+                + " catalog_inbox_quarantine,catalog_submission_inbox,catalog_submission_state,catalog_submission_versions,catalog_submission_metadata,catalog_outbox,catalog_offer_snapshots,catalog_publications,offer_schedule,offers,places,categories"
                 + " CASCADE");
     catalog.saveCategory(new Category("cafe", "Кафе", 1, true));
   }
@@ -142,7 +144,7 @@ class CatalogPersistenceTest {
             jdbc.getJdbcTemplate()
                 .queryForObject(
                     "SELECT count(*) FROM flyway_schema_history WHERE success", Integer.class))
-        .isEqualTo(2);
+        .isEqualTo(6);
   }
 
   @Test
@@ -192,7 +194,7 @@ class CatalogPersistenceTest {
     assertThat(publications.publish(retry)).isEqualTo(first);
     assertThat(count("places")).isEqualTo(1);
     assertThat(count("offers")).isEqualTo(2);
-    assertThat(count("catalog_outbox")).isEqualTo(1);
+    assertThat(count("catalog_outbox")).isEqualTo(2);
   }
 
   @Test
@@ -212,7 +214,7 @@ class CatalogPersistenceTest {
     }
     assertThat(count("offers")).isEqualTo(2);
     assertThat(count("catalog_publications")).isEqualTo(1);
-    assertThat(count("catalog_outbox")).isEqualTo(1);
+    assertThat(count("catalog_outbox")).isEqualTo(2);
   }
 
   @Test
@@ -319,7 +321,7 @@ class CatalogPersistenceTest {
             ReviewedSubmission.Type.CHANGE, existing.data(), List.of(changed), List.of(), 0, null);
     assertThatThrownBy(() -> publications.publish(stale)).hasMessage("CATALOG_VERSION_CONFLICT");
     assertThat(count("catalog_publications")).isEqualTo(2);
-    assertThat(count("catalog_outbox")).isEqualTo(2);
+    assertThat(count("catalog_outbox")).isEqualTo(4);
   }
 
   @Test
@@ -345,7 +347,7 @@ class CatalogPersistenceTest {
     assertThatThrownBy(() -> publications.publish(command)).hasMessage("CATALOG_VERSION_CONFLICT");
     assertThat(catalog.place(first.placeId()).orElseThrow()).isEqualTo(existing);
     assertThat(count("catalog_publications")).isEqualTo(1);
-    assertThat(count("catalog_outbox")).isEqualTo(1);
+    assertThat(count("catalog_outbox")).isEqualTo(2);
   }
 
   @Test
@@ -486,7 +488,9 @@ class CatalogPersistenceTest {
     var result = publications.publish(command);
     var event =
         jdbc.getJdbcTemplate()
-            .queryForObject("SELECT payload::text FROM catalog_outbox", String.class);
+            .queryForObject(
+                "SELECT payload::text FROM catalog_outbox WHERE topic='submission.workflow.v1'",
+                String.class);
     JsonNode message = json.readTree(event);
     assertThat(message.path("eventType").asText()).isEqualTo("OfferPublished");
     assertThat(message.path("schemaVersion").asInt()).isEqualTo(1);
@@ -496,11 +500,16 @@ class CatalogPersistenceTest {
         .isEqualTo(command.versionId().toString());
     assertThat(message.path("data").path("offerIds").size()).isEqualTo(result.offerIds().size());
     assertThat(
-            jdbc.getJdbcTemplate().queryForObject("SELECT topic FROM catalog_outbox", String.class))
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT topic FROM catalog_outbox WHERE topic='submission.workflow.v1'",
+                    String.class))
         .isEqualTo("submission.workflow.v1");
     assertThat(
             jdbc.getJdbcTemplate()
-                .queryForObject("SELECT published_at FROM catalog_outbox", Timestamp.class))
+                .queryForObject(
+                    "SELECT published_at FROM catalog_outbox WHERE topic='submission.workflow.v1'",
+                    Timestamp.class))
         .isNull();
   }
 
@@ -520,12 +529,882 @@ class CatalogPersistenceTest {
         folder.resolve("payload.json"), json.writeValueAsString(payload));
     String event =
         jdbc.getJdbcTemplate()
-            .queryForObject("SELECT payload::text FROM catalog_outbox", String.class);
+            .queryForObject(
+                "SELECT payload::text FROM catalog_outbox WHERE topic='submission.workflow.v1'",
+                String.class);
     java.nio.file.Files.writeString(folder.resolve("offer-published.json"), event);
     var note = new Source(SourceType.PERSONAL_VISIT, null, "Листовка");
     JsonNode noteJson = json.valueToTree(note);
     assertThat(noteJson.has("url")).isFalse();
     assertThat(noteJson.path("note").asText()).isEqualTo("Листовка");
+  }
+
+  @Autowired org.studentdiscounts.catalog.events.CatalogEvents searchEvents;
+  @Autowired org.studentdiscounts.catalog.events.CatalogEventBootstrap bootstrap;
+  @Autowired org.studentdiscounts.catalog.lifecycle.CatalogCategories categories;
+  @Autowired org.studentdiscounts.catalog.lifecycle.OfferExpiration expiration;
+  @Autowired org.springframework.transaction.PlatformTransactionManager transactionManager;
+
+  org.springframework.transaction.support.TransactionTemplate tx() {
+    return new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+  }
+
+  List<JsonNode> searchMessages() {
+    return jdbc.getJdbcTemplate()
+        .query(
+            "SELECT payload::text FROM catalog_outbox WHERE topic='catalog.search.events' ORDER BY"
+                + " delivery_sequence",
+            (rs, n) -> json.readTree(rs.getString(1)));
+  }
+
+  @Test
+  void searchSnapshotMatchesContractAndExcludesPrivateData() throws Exception {
+    var command = newPlace(2);
+    var result = publications.publish(command);
+    var message = searchMessages().getFirst();
+    assertThat(message.properties().stream().map(Map.Entry::getKey))
+        .containsExactlyInAnyOrder("eventId", "eventType", "occurredAt", "placeId", "data");
+    assertThat(message.path("eventType").asText()).isEqualTo("CatalogChanged");
+    assertThat(message.path("placeId").asText()).isEqualTo(result.placeId().toString());
+    var place = message.path("data").path("place");
+    assertThat(place.path("revision").asInt()).isZero();
+    assertThat(place.path("location").path("latitude").asDouble()).isEqualTo(59.9571);
+    assertThat(place.path("categoryName").asText()).isEqualTo("Кафе");
+    var offers = message.path("data").path("offers");
+    assertThat(offers.size()).isEqualTo(2);
+    assertThat(
+            offers
+                .get(0)
+                .path("schedule")
+                .get(0)
+                .path("intervals")
+                .get(0)
+                .path("timeUntil")
+                .asText())
+        .isEqualTo("24:00");
+    for (String field :
+        List.of(
+            "conditions",
+            "source",
+            "sourceNote",
+            "attachments",
+            "approvedVersionId",
+            "organizationId")) {
+      assertThat(message.toString()).doesNotContain("\"" + field + "\"");
+    }
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT message_key FROM catalog_outbox WHERE topic='catalog.search.events'",
+                Map.of(),
+                UUID.class))
+        .isEqualTo(result.placeId());
+    java.nio.file.Files.createDirectories(java.nio.file.Path.of("build/contract-samples"));
+    java.nio.file.Files.writeString(
+        java.nio.file.Path.of("build/contract-samples/catalog-changed.json"),
+        message.toPrettyString());
+  }
+
+  @Test
+  void unchangedSnapshotsAndCategorySortDoNotProduceEvents() {
+    var result = publications.publish(newPlace(1));
+    tx().executeWithoutResult(ignored -> searchEvents.record(result.placeId(), result.offerIds()));
+    categories.save(new Category("cafe", "Кафе", 9, true));
+    assertThat(searchMessages()).hasSize(1);
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT event_revision FROM offers WHERE id=:id",
+                Map.of("id", result.offerIds().getFirst()),
+                Integer.class))
+        .isZero();
+  }
+
+  @Test
+  void categoryRenameEmitsPlaceOnlyAndKeepsOfferAndRowVersions() {
+    var first = publications.publish(newPlace(1));
+    var second = publications.publish(newPlace(1));
+    categories.save(new Category("cafe", "Кофейни", 1, true));
+    var messages = searchMessages();
+    assertThat(messages).hasSize(4);
+    for (var message : messages.subList(2, 4)) {
+      assertThat(message.path("data").has("offers")).isFalse();
+      assertThat(message.path("data").path("place").path("revision").asInt()).isEqualTo(1);
+      assertThat(message.path("data").path("place").path("categoryName").asText())
+          .isEqualTo("Кофейни");
+    }
+    assertThat(catalog.place(first.placeId()).orElseThrow().rowVersion()).isZero();
+    assertThat(catalog.offer(second.offerIds().getFirst()).orElseThrow().rowVersion()).isZero();
+    categories.save(new Category("cafe", "Кофейни", 1, true));
+    assertThat(searchMessages()).hasSize(4);
+  }
+
+  @Test
+  void changedScheduleGroupsEqualDaysAndDoesNotResendPlace() {
+    var result = publications.publish(newPlace(1));
+    var original = offer("Обед");
+    var changed =
+        new OfferData(
+            result.offerIds().getFirst(),
+            original.conditions(),
+            original.discountType(),
+            original.discountValue(),
+            original.source(),
+            null,
+            null,
+            List.of(
+                new ScheduleInterval(2, TimeOfDay.parse("10:00"), TimeOfDay.parse("14:00")),
+                new ScheduleInterval(1, TimeOfDay.parse("10:00"), TimeOfDay.parse("14:00"))));
+    publications.publish(
+        reviewed(
+            ReviewedSubmission.Type.CHANGE,
+            catalog.place(result.placeId()).orElseThrow().data(),
+            List.of(changed),
+            List.of(),
+            0,
+            null));
+    var data = searchMessages().getLast().path("data");
+    assertThat(data.has("place")).isFalse();
+    assertThat(data.path("offers").get(0).path("revision").asInt()).isEqualTo(1);
+    assertThat(data.path("offers").get(0).path("validFrom").isNull()).isTrue();
+    assertThat(data.path("offers").get(0).path("schedule").size()).isEqualTo(1);
+    assertThat(data.path("offers").get(0).path("schedule").get(0).path("daysOfWeek").toString())
+        .isEqualTo("[1,2]");
+  }
+
+  @Test
+  void sharedPlaceChangeAdvancesPlaceWithoutChangingSiblingOfferSnapshot() {
+    var result = publications.publish(newPlace(2));
+    var place = catalog.place(result.placeId()).orElseThrow();
+    var changed =
+        new PlaceData(
+            place.id(),
+            "Новое название",
+            place.city(),
+            place.addressLine(),
+            place.location(),
+            place.categoryCode());
+    publications.publish(
+        reviewed(
+            ReviewedSubmission.Type.CHANGE,
+            changed,
+            List.of(catalog.offer(result.offerIds().getFirst()).orElseThrow().data()),
+            List.of(),
+            0,
+            0));
+    var data = searchMessages().getLast().path("data");
+    assertThat(data.has("offers")).isFalse();
+    assertThat(data.path("place").path("revision").asInt()).isEqualTo(1);
+    assertThat(catalog.offer(result.offerIds().get(1)).orElseThrow().rowVersion()).isZero();
+  }
+
+  @Test
+  void expirationUsesLocalEndOfDayAndIsIdempotent() {
+    var result = publications.publish(newPlace(2));
+    jdbc.update(
+        "UPDATE offers SET valid_until='2026-11-06' WHERE place_id=:id",
+        Map.of("id", result.placeId()));
+    var before =
+        new org.studentdiscounts.catalog.lifecycle.OfferExpiration(
+            jdbc, searchEvents, Clock.fixed(Instant.parse("2026-11-06T20:59:59Z"), ZoneOffset.UTC));
+    var after =
+        new org.studentdiscounts.catalog.lifecycle.OfferExpiration(
+            jdbc, searchEvents, Clock.fixed(Instant.parse("2026-11-06T21:00:00Z"), ZoneOffset.UTC));
+    assertThat(tx().<Integer>execute(ignored -> before.expireBatch(10))).isZero();
+    assertThat(tx().<Integer>execute(ignored -> after.expireBatch(10))).isEqualTo(2);
+    assertThat(tx().<Integer>execute(ignored -> after.expireBatch(10))).isZero();
+    var data = searchMessages().getLast().path("data");
+    assertThat(data.has("place")).isFalse();
+    assertThat(data.path("offers").size()).isEqualTo(2);
+    assertThat(data.path("offers").get(0).path("status").asText()).isEqualTo("EXPIRED");
+    assertThat(catalog.offer(result.offerIds().getFirst()).orElseThrow().rowVersion()).isEqualTo(1);
+    assertThat(catalog.offer(result.offerIds().getFirst()).orElseThrow().lastVerifiedAt())
+        .isEqualTo(Instant.parse("2026-11-06T10:00:00Z"));
+  }
+
+  @Test
+  void concurrentExpirationOnlyTransitionsOnce() throws Exception {
+    var result = publications.publish(newPlace(2));
+    jdbc.update(
+        "UPDATE offers SET valid_until='2026-11-05' WHERE place_id=:id",
+        Map.of("id", result.placeId()));
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var start = new CountDownLatch(1);
+      Callable<Integer> action =
+          () -> {
+            start.await();
+            return expiration.expireBatch(10);
+          };
+      var first = executor.submit(action);
+      var second = executor.submit(action);
+      start.countDown();
+      assertThat(first.get(20, TimeUnit.SECONDS) + second.get(20, TimeUnit.SECONDS)).isEqualTo(2);
+    }
+    assertThat(searchMessages()).hasSize(2);
+  }
+
+  @Test
+  void expirationAndEventRollbackTogether() {
+    var result = publications.publish(newPlace(1));
+    jdbc.update(
+        "UPDATE offers SET valid_until='2026-11-05' WHERE place_id=:id",
+        Map.of("id", result.placeId()));
+    tx().executeWithoutResult(status -> {
+      expiration.expireBatch(10);
+      status.setRollbackOnly();
+    });
+    assertThat(catalog.offer(result.offerIds().getFirst()).orElseThrow().status())
+        .isEqualTo(OfferStatus.ACTIVE);
+    assertThat(searchMessages()).hasSize(1);
+  }
+
+  @Test
+  void bootstrapCreatesInitialEventsForPreMigrationRowsOnce() {
+    var result = publications.publish(newPlace(2));
+    jdbc.getJdbcTemplate().update("DELETE FROM catalog_outbox WHERE topic='catalog.search.events'");
+    jdbc.getJdbcTemplate().update("UPDATE places SET event_snapshot=NULL");
+    jdbc.getJdbcTemplate().update("UPDATE offers SET event_snapshot=NULL");
+    assertThat(bootstrap.initializeBatch(1)).isEqualTo(1);
+    assertThat(bootstrap.initializeBatch(1)).isZero();
+    assertThat(searchMessages()).hasSize(1);
+    assertThat(searchMessages().getFirst().path("data").path("offers").size()).isEqualTo(2);
+    assertThat(searchMessages().getFirst().path("placeId").asText())
+        .isEqualTo(result.placeId().toString());
+  }
+
+  @Test
+  void publicCardExcludesPrivateFieldsAndUnavailableOffersBeforeWorker() throws Exception {
+    var result = publications.publish(newPlace(5));
+    jdbc.update(
+        "UPDATE offers SET valid_until='2026-11-05' WHERE id=:id",
+        Map.of("id", result.offerIds().get(1)));
+    jdbc.update(
+        "UPDATE offers SET valid_from='2026-11-07' WHERE id=:id",
+        Map.of("id", result.offerIds().get(2)));
+    jdbc.update(
+        "UPDATE offers SET status='SUSPENDED' WHERE id=:id",
+        Map.of("id", result.offerIds().get(3)));
+    jdbc.update(
+        "UPDATE offers SET status='ARCHIVED' WHERE id=:id", Map.of("id", result.offerIds().get(4)));
+    var card = get("/api/v1/catalog/places/" + result.placeId(), 200);
+    assertThat(card.path("offers").size()).isEqualTo(1);
+    assertThat(card.path("offers").get(0).path("conditions").asText()).isEqualTo("Скидка 0");
+    assertThat(card.path("offers").get(0).path("source").has("note")).isFalse();
+    for (String field : List.of("attachments", "rowVersion", "approvedVersionId", "organizationId"))
+      assertThat(card.toString()).doesNotContain("\"" + field + "\"");
+    jdbc.update(
+        "UPDATE offers SET status='EXPIRED' WHERE place_id=:id", Map.of("id", result.placeId()));
+    get("/api/v1/catalog/places/" + result.placeId(), 404);
+    get("/api/v1/catalog/places/not-a-uuid", 400);
+    get("/api/v1/catalog/places/" + UUID.randomUUID(), 404);
+  }
+
+  @Test
+  void failedDeliveryKeepsExactEventAndUnsupportedSearchPending() {
+    publications.publish(newPlace(1));
+    var sender =
+        org.mockito.Mockito.mock(org.studentdiscounts.catalog.integration.EventTransport.class);
+    org.mockito.Mockito.when(sender.topics()).thenReturn(Set.of("submission.workflow.v1"));
+    var relay =
+        new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+            jdbc, tx(), List.of(sender), Clock.systemUTC());
+    var original =
+        jdbc.getJdbcTemplate()
+            .queryForObject(
+                "SELECT payload::text FROM catalog_outbox WHERE topic='submission.workflow.v1'",
+                String.class);
+    org.mockito.Mockito.doThrow(new IllegalStateException("broker unavailable"))
+        .doNothing()
+        .when(sender)
+        .send(
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString());
+    assertThat(relay.relayBatch(5)).isZero();
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT count(*) FROM catalog_outbox WHERE published_at IS NOT NULL",
+                    Integer.class))
+        .isZero();
+    assertThat(relay.relayBatch(5)).isZero();
+    var retry =
+        new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+            jdbc, tx(), List.of(sender), Clock.offset(Clock.systemUTC(), Duration.ofSeconds(10)));
+    assertThat(retry.relayBatch(5)).isEqualTo(1);
+    assertThat(relay.relayBatch(5)).isZero();
+    org.mockito.Mockito.verify(sender, org.mockito.Mockito.times(2))
+        .send(
+            org.mockito.ArgumentMatchers.eq("submission.workflow.v1"),
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.eq(original));
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT published_at IS NULL FROM catalog_outbox WHERE"
+                        + " topic='catalog.search.events'",
+                    Boolean.class))
+        .isTrue();
+  }
+
+  @Test
+  void concurrentRelayCannotOvertakeLockedPlaceEvent() throws Exception {
+    var result = publications.publish(newPlace(1));
+    categories.save(new Category("cafe", "Кофейни", 1, true));
+    var entered = new CountDownLatch(1);
+    var release = new CountDownLatch(1);
+    var bodies = new java.util.concurrent.CopyOnWriteArrayList<String>();
+    var sender =
+        new org.studentdiscounts.catalog.integration.EventTransport() {
+          public Set<String> topics() {
+            return Set.of("catalog.search.events");
+          }
+
+          public void send(String topic, String key, String body) {
+            assertThat(key).isEqualTo(result.placeId().toString());
+            bodies.add(body);
+            if (bodies.size() == 1) {
+              entered.countDown();
+              try {
+                if (!release.await(10, TimeUnit.SECONDS))
+                  throw new IllegalStateException("timeout");
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+              }
+            }
+          }
+        };
+    var relay =
+        new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+            jdbc, tx(), List.of(sender), Clock.systemUTC());
+    try (var executor = Executors.newFixedThreadPool(2)) {
+      var first = executor.submit(() -> relay.relayBatch(1));
+      try {
+        assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(executor.submit(() -> relay.relayBatch(1)).get(10, TimeUnit.SECONDS)).isZero();
+      } finally {
+        release.countDown();
+      }
+      assertThat(first.get(10, TimeUnit.SECONDS)).isEqualTo(1);
+    }
+    assertThat(relay.relayBatch(1)).isEqualTo(1);
+    assertThat(json.readTree(bodies.get(0)).path("data").path("place").path("revision").asInt())
+        .isZero();
+    assertThat(json.readTree(bodies.get(1)).path("data").path("place").path("revision").asInt())
+        .isEqualTo(1);
+  }
+
+  @Test
+  void kafkaAcknowledgementAndLostDatabaseCommitReplaySameEvent() {
+    var command = newPlace(1);
+    var result = publications.publish(command);
+    try (var kafka = new org.testcontainers.kafka.KafkaContainer("apache/kafka:4.1.0")) {
+      kafka.start();
+      var producerProps = new HashMap<String, Object>();
+      producerProps.put("bootstrap.servers", kafka.getBootstrapServers());
+      producerProps.put(
+          "key.serializer", org.apache.kafka.common.serialization.StringSerializer.class);
+      producerProps.put(
+          "value.serializer", org.apache.kafka.common.serialization.StringSerializer.class);
+      producerProps.put("acks", "all");
+      producerProps.put("enable.idempotence", true);
+      producerProps.put("max.block.ms", 10000);
+      var factory =
+          new org.springframework.kafka.core.DefaultKafkaProducerFactory<String, String>(
+              producerProps);
+      try {
+        var template = new org.springframework.kafka.core.KafkaTemplate<>(factory);
+        var transport = new org.studentdiscounts.catalog.integration.WorkflowTransport(template);
+        var failOnce = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var losingCommit =
+            new org.studentdiscounts.catalog.integration.EventTransport() {
+              public Set<String> topics() {
+                return transport.topics();
+              }
+
+              public void send(String topic, String key, String payload) {
+                transport.send(topic, key, payload);
+                if (failOnce.getAndSet(false))
+                  throw new IllegalStateException(
+                      "database commit lost after Kafka acknowledgement");
+              }
+            };
+        var relay =
+            new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+                jdbc, tx(), List.of(losingCommit), Clock.systemUTC());
+        assertThat(relay.relayBatch(1)).isZero();
+        var retry =
+            new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+                jdbc,
+                tx(),
+                List.of(losingCommit),
+                Clock.offset(Clock.systemUTC(), Duration.ofSeconds(10)));
+        assertThat(retry.relayBatch(1)).isEqualTo(1);
+        assertThat(relay.relayBatch(1)).isZero();
+        var props = new HashMap<String, Object>();
+        props.put("bootstrap.servers", kafka.getBootstrapServers());
+        props.put("group.id", UUID.randomUUID().toString());
+        props.put("auto.offset.reset", "earliest");
+        props.put("enable.auto.commit", false);
+        props.put(
+            "key.deserializer", org.apache.kafka.common.serialization.StringDeserializer.class);
+        props.put(
+            "value.deserializer", org.apache.kafka.common.serialization.StringDeserializer.class);
+        try (var consumer =
+            new org.apache.kafka.clients.consumer.KafkaConsumer<String, String>(props)) {
+          consumer.subscribe(List.of("submission.workflow.v1"));
+          var records =
+              new ArrayList<org.apache.kafka.clients.consumer.ConsumerRecord<String, String>>();
+          var deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+          while (records.size() < 2 && System.nanoTime() < deadline)
+            consumer.poll(Duration.ofMillis(250)).forEach(records::add);
+          assertThat(records).hasSize(2);
+          assertThat(records.get(0).key()).isEqualTo(command.submissionId().toString());
+          assertThat(records.get(0).value()).isEqualTo(records.get(1).value());
+          var message = json.readTree(records.getFirst().value());
+          assertThat(message.path("eventType").asText()).isEqualTo("OfferPublished");
+          assertThat(message.path("data").path("expectedRowVersion").asInt()).isEqualTo(4);
+          assertThat(message.path("data").path("offerIds").get(0).asText())
+              .isEqualTo(result.offerIds().getFirst().toString());
+        }
+      } finally {
+        factory.destroy();
+      }
+    }
+  }
+
+  @Autowired org.studentdiscounts.catalog.integration.SubmissionInbox inbox;
+  @Autowired org.studentdiscounts.catalog.integration.ApprovedPublicationWorker approvedWorker;
+
+  tools.jackson.databind.node.ObjectNode envelope(ReviewedSubmission command, String type) {
+    var event =
+        json.createObjectNode()
+            .put("eventId", UUID.randomUUID().toString())
+            .put("eventType", type)
+            .put("producer", "submission")
+            .put("schemaVersion", 1)
+            .put("occurredAt", "2026-11-06T10:00:00Z")
+            .put("correlationId", command.correlationId());
+    event
+        .putObject("data")
+        .put("submissionId", command.submissionId().toString())
+        .put("versionId", command.versionId().toString())
+        .put("versionNo", command.versionNo());
+    return event;
+  }
+
+  tools.jackson.databind.node.ObjectNode versionEvent(ReviewedSubmission command) {
+    var event = envelope(command, "SubmissionSubmitted").put("aggregateSequence", 1);
+    var data = (tools.jackson.databind.node.ObjectNode) event.path("data");
+    JsonNode payload = json.valueToTree(command.payload());
+    data.set("payload", payload);
+    data.put("payloadSchemaVersion", 1)
+        .put(
+            "contentSha256",
+            org.studentdiscounts.catalog.integration.SubmissionPayloadHash.hash(payload))
+        .put("authorId", UUID.randomUUID().toString())
+        .put("rowVersion", 1);
+    data.set("baseOfferRowVersion", json.valueToTree(command.baseOfferRowVersion()));
+    return event;
+  }
+
+  tools.jackson.databind.node.ObjectNode metadataEvent(ReviewedSubmission command) {
+    var event = envelope(command, "SubmissionPublicationMetadata");
+    var data = (tools.jackson.databind.node.ObjectNode) event.path("data");
+    data.put("type", command.type().name()).put("resolvedTimezone", command.resolvedTimezone());
+    data.set("basePlaceRowVersion", json.valueToTree(command.basePlaceRowVersion()));
+    return event;
+  }
+
+  tools.jackson.databind.node.ObjectNode approvalEvent(ReviewedSubmission command) {
+    var event = envelope(command, "SubmissionStatusChanged").put("aggregateSequence", 2);
+    ((tools.jackson.databind.node.ObjectNode) event.path("data"))
+        .put("fromStatus", "IN_REVIEW")
+        .put("toStatus", "APPROVED")
+        .put("rowVersion", command.expectedSubmissionRowVersion());
+    return event;
+  }
+
+  void receive(JsonNode event) {
+    String topic =
+        event.path("eventType").asText().equals("SubmissionPublicationMetadata")
+            ? "catalog.publication.metadata.v1"
+            : "submission.events.v1";
+    inbox.accept(topic, event.path("data").path("submissionId").asText(), event.toString());
+  }
+
+  @Test
+  void publicationWaitsForCommittedApprovalAndExactMetadataThenReplaysSafely() {
+    var command = newPlace(1);
+    var version = versionEvent(command);
+    var approval = approvalEvent(command);
+    var metadata = metadataEvent(command);
+    receive(version);
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    receive(approval);
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    receive(metadata);
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    receive(version);
+    receive(approval);
+    receive(metadata);
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    assertThat(count("offers")).isEqualTo(1);
+    assertThat(count("catalog_submission_inbox")).isEqualTo(3);
+    assertThat(count("catalog_outbox")).isEqualTo(2);
+  }
+
+  @Test
+  void outOfOrderMetadataAndSnapshotDoNotLoseApproval() {
+    var command = newPlace(1);
+    receive(metadataEvent(command));
+    receive(approvalEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    receive(versionEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(count("offers")).isEqualTo(1);
+  }
+
+  @Test
+  void newerRejectionPreventsOlderApprovalFromPublishing() {
+    var command = newPlace(1);
+    receive(versionEvent(command));
+    receive(metadataEvent(command));
+    var rejection = approvalEvent(command).put("aggregateSequence", 3);
+    ((tools.jackson.databind.node.ObjectNode) rejection.path("data")).put("toStatus", "REJECTED");
+    receive(rejection);
+    receive(approvalEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+    assertThat(count("offers")).isZero();
+  }
+
+  @Test
+  void untrustedShapeReusedIdentityAndChangedVersionAreRejected() {
+    var command = newPlace(1);
+    var event = versionEvent(command);
+    assertThatThrownBy(() ->
+            inbox.accept("submission.events.v1", UUID.randomUUID().toString(), event.toString()))
+        .isInstanceOf(IllegalArgumentException.class);
+    var raw =
+        approvalEvent(command).put("eventType", "SubmissionApproved").put("producer", "moderation");
+    assertThatThrownBy(() -> receive(raw)).isInstanceOf(IllegalArgumentException.class);
+    receive(event);
+    var reused = event.deepCopy().put("correlationId", "changed");
+    assertThatThrownBy(() -> receive(reused)).hasMessage("EVENT_ID_REUSED");
+    var changed = versionEvent(command).put("aggregateSequence", 3);
+    var data = (tools.jackson.databind.node.ObjectNode) changed.path("data");
+    ((tools.jackson.databind.node.ObjectNode) data.path("payload").path("place"))
+        .put("name", "Подмена");
+    assertThatThrownBy(() -> receive(changed)).hasMessage("VERSION_HASH_MISMATCH");
+    data.put(
+        "contentSha256",
+        org.studentdiscounts.catalog.integration.SubmissionPayloadHash.hash(data.path("payload")));
+    assertThatThrownBy(() -> receive(changed)).hasMessage("VERSION_CONTENT_CONFLICT");
+    assertThat(count("catalog_submission_inbox")).isEqualTo(1);
+  }
+
+  @Test
+  void staleChangeProducesConflictWithoutPartialWrites() {
+    var first = publications.publish(newPlace(1));
+    var place = catalog.place(first.placeId()).orElseThrow();
+    var changedPlace =
+        new PlaceData(
+            place.id(),
+            "Название не должно измениться",
+            place.city(),
+            place.addressLine(),
+            place.location(),
+            place.categoryCode());
+    var command =
+        reviewed(
+            ReviewedSubmission.Type.CHANGE,
+            changedPlace,
+            List.of(offer("Устаревшая правка").identified(first.offerIds().getFirst())),
+            List.of(),
+            9,
+            0);
+    receive(versionEvent(command));
+    receive(metadataEvent(command));
+    receive(approvalEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(catalog.place(place.id()).orElseThrow()).isEqualTo(place);
+    assertThat(count("catalog_publications")).isEqualTo(1);
+    assertThat(searchMessages()).hasSize(1);
+    var conflict =
+        json.readTree(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT payload::text FROM catalog_outbox WHERE"
+                        + " payload->>'eventType'='OfferPublicationConflicted'",
+                    String.class));
+    assertThat(conflict.path("data").path("reason").asText()).isEqualTo("CATALOG_VERSION_CONFLICT");
+    assertThat(conflict.path("data").path("expectedRowVersion").asInt()).isEqualTo(4);
+    assertThat(approvedWorker.publishBatch(10)).isZero();
+  }
+
+  @Test
+  void missingPlaceVersionDoesNotSilentlyOverwritePlace() {
+    var first = publications.publish(newPlace(1));
+    var place = catalog.place(first.placeId()).orElseThrow();
+    var changed =
+        new PlaceData(
+            place.id(),
+            "Новое имя",
+            place.city(),
+            place.addressLine(),
+            place.location(),
+            place.categoryCode());
+    var command =
+        reviewed(
+            ReviewedSubmission.Type.CHANGE,
+            changed,
+            List.of(offer("Правка").identified(first.offerIds().getFirst())),
+            List.of(),
+            0,
+            null);
+    receive(versionEvent(command));
+    receive(metadataEvent(command));
+    receive(approvalEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(catalog.place(place.id()).orElseThrow()).isEqualTo(place);
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT publication_outcome FROM catalog_submission_state", String.class))
+        .isEqualTo("CONFLICTED");
+  }
+
+  @Test
+  void upgradesVersionTwoDatabaseWithoutLosingPublishedData() throws Exception {
+    String database = "catalog_upgrade_" + UUID.randomUUID().toString().replace("-", "");
+    jdbc.getJdbcTemplate().execute("CREATE DATABASE " + database);
+    String url =
+        "jdbc:postgresql://"
+            + DATABASE.getHost()
+            + ":"
+            + DATABASE.getMappedPort(5432)
+            + "/"
+            + database;
+    try {
+      var source =
+          new org.springframework.jdbc.datasource.DriverManagerDataSource(
+              url, DATABASE.getUsername(), DATABASE.getPassword());
+      var oldFlyway = org.flywaydb.core.Flyway.configure().dataSource(source).target("2").load();
+      oldFlyway.migrate();
+      var old = new org.springframework.jdbc.core.JdbcTemplate(source);
+      UUID place = UUID.randomUUID(), offer = UUID.randomUUID(), version = UUID.randomUUID();
+      old.update("INSERT INTO categories(code,name) VALUES('cafe','Кафе')");
+      old.update(
+          "INSERT INTO"
+              + " places(id,name,city,address_line,address_normalized,location,category_code,timezone)"
+              + " VALUES(?,'Кафе','Москва','ул. Ленина, 1','ул. ленина,"
+              + " 1',ST_SetSRID(ST_MakePoint(37.6,55.7),4326)::geography,'cafe','Europe/Moscow')",
+          place);
+      old.update(
+          "INSERT INTO"
+              + " offers(id,place_id,status,conditions,discount_type,source_type,source_url,last_verified_at,approved_version_id)"
+              + " VALUES(?,?,'ACTIVE','Скидка"
+              + " студентам','OTHER','WEBSITE','https://example.com',now(),?)",
+          offer,
+          place,
+          version);
+      old.update(
+          "INSERT INTO catalog_publications(version_id,submission_id,version_no,command_hash)"
+              + " VALUES(?,?,1,?)",
+          version,
+          UUID.randomUUID(),
+          "0".repeat(64));
+      old.update(
+          "INSERT INTO catalog_outbox(id,version_id,topic,message_key,payload,occurred_at)"
+              + " VALUES(?,?,'submission.workflow.v1',?,'{}',now())",
+          UUID.randomUUID(),
+          version,
+          UUID.randomUUID());
+      org.flywaydb.core.Flyway.configure().dataSource(source).load().migrate();
+      assertThat(old.queryForObject("SELECT count(*) FROM offers WHERE id=?", Integer.class, offer))
+          .isEqualTo(1);
+      assertThat(
+              old.queryForObject("SELECT conditions FROM offers WHERE id=?", String.class, offer))
+          .isEqualTo("Скидка студентам");
+      assertThat(
+              old.queryForObject(
+                  "SELECT event_revision FROM places WHERE id=?", Integer.class, place))
+          .isZero();
+      assertThat(
+              old.queryForObject(
+                  "SELECT event_snapshot IS NULL FROM places WHERE id=?", Boolean.class, place))
+          .isTrue();
+      assertThat(old.queryForObject("SELECT delivery_sequence FROM catalog_outbox", Long.class))
+          .isPositive();
+      assertThat(
+              old.queryForObject(
+                  "SELECT count(*) FROM flyway_schema_history WHERE success", Integer.class))
+          .isEqualTo(6);
+    } finally {
+      jdbc.getJdbcTemplate().execute("DROP DATABASE " + database + " WITH (FORCE)");
+    }
+  }
+
+  @Test
+  void unavailableSearchDoesNotBlockWorkflowStream() {
+    publications.publish(newPlace(1));
+    var search =
+        org.mockito.Mockito.mock(org.studentdiscounts.catalog.integration.EventTransport.class);
+    var workflow =
+        org.mockito.Mockito.mock(org.studentdiscounts.catalog.integration.EventTransport.class);
+    org.mockito.Mockito.when(search.topics()).thenReturn(Set.of("catalog.search.events"));
+    org.mockito.Mockito.when(workflow.topics()).thenReturn(Set.of("submission.workflow.v1"));
+    org.mockito.Mockito.doThrow(new IllegalStateException("registry offline"))
+        .when(search)
+        .send(
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString(),
+            org.mockito.ArgumentMatchers.anyString());
+    var relay =
+        new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+            jdbc, tx(), List.of(search, workflow), Clock.systemUTC());
+    assertThat(relay.relayBatch(10)).isEqualTo(1);
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT delivery_failures FROM catalog_outbox WHERE"
+                        + " topic='catalog.search.events'",
+                    Integer.class))
+        .isEqualTo(1);
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject(
+                    "SELECT published_at IS NULL FROM catalog_outbox WHERE"
+                        + " topic='catalog.search.events'",
+                    Boolean.class))
+        .isTrue();
+  }
+
+  @Test
+  void proofAllowsPartialSourceAndMalformedSnapshotDoesNotStarveFollowingApproval() {
+    var partial = newPlace(1);
+    var version = versionEvent(partial);
+    var payload = (tools.jackson.databind.node.ObjectNode) version.path("data").path("payload");
+    ((tools.jackson.databind.node.ObjectNode) payload.path("offers").get(0))
+        .putObject("source")
+        .put("type", "WEBSITE");
+    payload
+        .putArray("attachments")
+        .addObject()
+        .put("mediaAssetId", UUID.randomUUID().toString())
+        .put("purpose", "PROOF")
+        .put("offerIndex", 0);
+    ((tools.jackson.databind.node.ObjectNode) version.path("data"))
+        .put(
+            "contentSha256",
+            org.studentdiscounts.catalog.integration.SubmissionPayloadHash.hash(payload));
+    receive(version);
+    receive(metadataEvent(partial));
+    receive(approvalEvent(partial));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(count("offers")).isEqualTo(1);
+    assertThat(
+            jdbc.getJdbcTemplate()
+                .queryForObject("SELECT source_type IS NULL FROM offers", Boolean.class))
+        .isTrue();
+    var invalid = newPlace(1);
+    var invalidVersion = versionEvent(invalid);
+    ((tools.jackson.databind.node.ObjectNode)
+            invalidVersion.path("data").path("payload").path("place"))
+        .put("name", "");
+    ((tools.jackson.databind.node.ObjectNode) invalidVersion.path("data"))
+        .put(
+            "contentSha256",
+            org.studentdiscounts.catalog.integration.SubmissionPayloadHash.hash(
+                invalidVersion.path("data").path("payload")));
+    receive(invalidVersion);
+    receive(metadataEvent(invalid));
+    receive(approvalEvent(invalid));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(
+            jdbc.queryForObject(
+                "SELECT publication_outcome FROM catalog_submission_state WHERE submission_id=:id",
+                Map.of("id", invalid.submissionId()),
+                String.class))
+        .isEqualTo("BLOCKED");
+    var valid = newPlace(1);
+    receive(versionEvent(valid));
+    receive(metadataEvent(valid));
+    receive(approvalEvent(valid));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+    assertThat(count("offers")).isEqualTo(2);
+  }
+
+  @Test
+  void invalidRecordIsQuarantinedBeforeNextValidRecord() {
+    var quarantine = new org.studentdiscounts.catalog.integration.InboxQuarantine(jdbc);
+    var listener =
+        new org.studentdiscounts.catalog.integration.SubmissionListener(inbox, quarantine);
+    var invalid =
+        new org.apache.kafka.clients.consumer.ConsumerRecord<String, String>(
+            "catalog.publication.metadata.v1", 0, 1, "bad-key", "{invalid");
+    listener.receive(invalid);
+    assertThat(count("catalog_inbox_quarantine")).isEqualTo(1);
+    var command = newPlace(1);
+    listener.receive(
+        new org.apache.kafka.clients.consumer.ConsumerRecord<>(
+            "catalog.publication.metadata.v1",
+            0,
+            2,
+            command.submissionId().toString(),
+            metadataEvent(command).toString()));
+    assertThat(count("catalog_submission_metadata")).isEqualTo(1);
+    receive(versionEvent(command));
+    receive(approvalEvent(command));
+    assertThat(approvedWorker.publishBatch(10)).isEqualTo(1);
+  }
+
+  @Test
+  void slowFailingStreamsCannotStarveLaterWorkflowAcrossBatches() {
+    for (String topic :
+        List.of("catalog.search.events", "catalog.search.events", "submission.workflow.v1"))
+      jdbc.update(
+          "INSERT INTO catalog_outbox(id,topic,message_key,payload,occurred_at)"
+              + " VALUES(:id,:topic,:key,'{}',now())",
+          Map.of("id", UUID.randomUUID(), "topic", topic, "key", UUID.randomUUID()));
+    var now =
+        new java.util.concurrent.atomic.AtomicReference<>(Instant.parse("2026-11-19T12:00:00Z"));
+    var clock =
+        new Clock() {
+          public ZoneId getZone() {
+            return ZoneOffset.UTC;
+          }
+
+          public Clock withZone(ZoneId zone) {
+            return this;
+          }
+
+          public Instant instant() {
+            return now.get();
+          }
+        };
+    var deliveries = new java.util.concurrent.atomic.AtomicInteger();
+    var sender =
+        new org.studentdiscounts.catalog.integration.EventTransport() {
+          public Set<String> topics() {
+            return Set.of("catalog.search.events", "submission.workflow.v1");
+          }
+
+          public void send(String topic, String key, String payload) {
+            if (topic.equals("catalog.search.events")) {
+              now.updateAndGet(t -> t.plusSeconds(6));
+              throw new IllegalStateException("slow registry failure");
+            }
+            deliveries.incrementAndGet();
+          }
+        };
+    var relay =
+        new org.studentdiscounts.catalog.integration.CatalogOutboxRelay(
+            jdbc, tx(), List.of(sender), clock);
+    assertThat(relay.relayBatch(1)).isZero();
+    assertThat(relay.relayBatch(1)).isZero();
+    assertThat(relay.relayBatch(1)).isEqualTo(1);
+    assertThat(deliveries.get()).isEqualTo(1);
   }
 
   private JsonNode get(String path, int status) throws Exception {

@@ -8,6 +8,28 @@ spring:
     url: ${CATALOG_DB_URL}
     username: ${CATALOG_DB_USER}
     password: ${CATALOG_DB_PASSWORD}
+  kafka:
+    bootstrap-servers: ${CATALOG_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.studentdiscounts.catalog.integration.CatalogEventSerializer
+      acks: all
+      properties:
+        schema.registry.url: ${CATALOG_SCHEMA_REGISTRY_URL:}
+        auto.register.schemas: false
+        normalize.schemas: true
+        json.fail.invalid.schema: true
+        http.connect.timeout.ms: 3000
+        http.read.timeout.ms: 5000
+        enable.idempotence: true
+        max.block.ms: 10000
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
   flyway:
     enabled: true
 management:
@@ -18,3 +40,18 @@ management:
   endpoint:
     health:
       show-details: never
+
+catalog:
+  expiration:
+    enabled: ${CATALOG_EXPIRATION_ENABLED:true}
+    delay-ms: ${CATALOG_EXPIRATION_DELAY_MS:60000}
+  bootstrap:
+    enabled: ${CATALOG_BOOTSTRAP_ENABLED:true}
+  workflow-delivery:
+    enabled: ${CATALOG_WORKFLOW_DELIVERY_ENABLED:false}
+    delay-ms: ${CATALOG_WORKFLOW_DELIVERY_DELAY_MS:500}
+  search-delivery:
+    enabled: ${CATALOG_SEARCH_DELIVERY_ENABLED:false}
+  submission:
+    enabled: ${CATALOG_SUBMISSION_ENABLED:false}
+    group-id: ${CATALOG_SUBMISSION_GROUP_ID:catalog-publication-v1}
