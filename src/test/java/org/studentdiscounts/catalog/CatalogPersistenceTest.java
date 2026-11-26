@@ -1408,13 +1408,52 @@ class CatalogPersistenceTest {
   }
 
   private JsonNode get(String path, int status) throws Exception {
+    return send(
+        HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path)).GET(), status);
+  }
+
+  private JsonNode send(HttpRequest.Builder request, int status) throws Exception {
     try (var http = HttpClient.newHttpClient()) {
-      var response =
-          http.send(
-              HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path)).GET().build(),
-              HttpResponse.BodyHandlers.ofString());
+      var response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
       assertThat(response.statusCode()).isEqualTo(status);
-      return response.body().isBlank() ? json.createObjectNode() : json.readTree(response.body());
+      JsonNode body =
+          response.body().isBlank() ? json.createObjectNode() : json.readTree(response.body());
+      if (status >= 400) {
+        assertThat(response.headers().firstValue("Content-Type").orElse(""))
+            .startsWith("application/problem+json");
+        assertThat(body.path("status").asInt()).isEqualTo(status);
+        assertThat(body.path("type").asText()).isEqualTo("about:blank");
+        assertThat(body.path("code").asText()).isNotBlank();
+      }
+      return body;
     }
+  }
+
+  @Test
+  void errorsUseProblemJson() throws Exception {
+    assertThat(get("/api/v1/catalog/unknown", 404).path("code").asText()).isEqualTo("NOT_FOUND");
+    assertThat(get("/unknown-root", 404).path("code").asText()).isEqualTo("NOT_FOUND");
+    assertThat(get("/api/v1/catalog/places/not-a-uuid", 400).path("code").asText())
+        .isEqualTo("MALFORMED_REQUEST");
+    var deleted =
+        HttpRequest.newBuilder(
+                URI.create(
+                    "http://127.0.0.1:" + port + "/api/v1/catalog/places/" + UUID.randomUUID()))
+            .DELETE();
+    assertThat(send(deleted, 405).path("code").asText()).isEqualTo("METHOD_NOT_ALLOWED");
+    var correlated =
+        HttpRequest.newBuilder(
+                URI.create(
+                    "http://127.0.0.1:" + port + "/api/v1/catalog/places/" + UUID.randomUUID()))
+            .header("X-Correlation-ID", "gateway-test-1")
+            .GET();
+    assertThat(send(correlated, 404).path("correlationId").asText()).isEqualTo("gateway-test-1");
+    var forged =
+        HttpRequest.newBuilder(
+                URI.create(
+                    "http://127.0.0.1:" + port + "/api/v1/catalog/places/" + UUID.randomUUID()))
+            .header("X-Correlation-ID", "bad value with spaces")
+            .GET();
+    assertThat(send(forged, 404).has("correlationId")).isFalse();
   }
 }

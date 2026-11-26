@@ -55,7 +55,11 @@ docker compose up -d --wait
 ./gradlew bootRun --args='--spring.profiles.active=local'
 ```
 
-Приложение слушает `127.0.0.1:8082`, PostgreSQL — `127.0.0.1:5434`. Локальные credentials есть только в Compose и локальном профиле. Вне локального профиля нужны `CATALOG_DB_URL`, `CATALOG_DB_USER`, `CATALOG_DB_PASSWORD`.
+Приложение слушает `127.0.0.1:8084`, PostgreSQL — `127.0.0.1:5436`. Порт 8084 совпадает с upstream каталога в Kong (`gateway/kong.yml`), 5436 выбран, чтобы не пересекаться с базами auth (5432), submission (5433), moderation (5434), media и search (5435).
+
+Ошибки сервиса, включая неизвестный путь, возвращаются в формате `application/problem+json`: `type`, `status`, `code` и `correlationId` из заголовка `X-Correlation-ID`.
+
+Kong обращается к сервисам через `host.docker.internal`. На macOS с Colima или Docker Desktop это доходит до `127.0.0.1`. На Linux `host-gateway` указывает на адрес моста, поэтому нужен `CATALOG_BIND_ADDRESS=0.0.0.0`. По умолчанию каталог остаётся на loopback: внутренние маршруты `/catalog/v1` отдают приватные поля без сервисной аутентификации, их нельзя открывать в сеть. Локальные credentials есть только в Compose и локальном профиле. Вне локального профиля нужны `CATALOG_DB_URL`, `CATALOG_DB_USER`, `CATALOG_DB_PASSWORD`.
 
 При таком запуске доступны чтение и обработка сроков. Kafka consumer/отправители выключены, outbox сохраняется. Для включения нужны брокер, топики, metadata-издатель и Registry; флаги и порядок приведены в [инструкции интеграции](docs/INTEGRATION.md).
 
