@@ -26,7 +26,12 @@ public class CatalogQueries {
       int rowVersion) {}
 
   public record OfferView(
-      UUID id, UUID placeId, OfferStatus status, int rowVersion, JsonNode payload) {}
+      UUID id,
+      UUID placeId,
+      OfferStatus status,
+      int rowVersion,
+      int placeRowVersion,
+      JsonNode payload) {}
 
   private final CatalogRepository repository;
 
@@ -53,8 +58,14 @@ public class CatalogQueries {
 
   public OfferView offer(UUID id) {
     var offer = repository.offer(id).orElseThrow(CatalogQueries::notFound);
+    var place = repository.place(offer.placeId()).orElseThrow(CatalogQueries::notFound);
     return new OfferView(
-        offer.id(), offer.placeId(), offer.status(), offer.rowVersion(), repository.payload(id));
+        offer.id(),
+        offer.placeId(),
+        offer.status(),
+        offer.rowVersion(),
+        place.rowVersion(),
+        repository.payload(id));
   }
 
   private static ResponseStatusException notFound() {

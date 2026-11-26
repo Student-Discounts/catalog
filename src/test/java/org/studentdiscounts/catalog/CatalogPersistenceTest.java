@@ -468,6 +468,8 @@ class CatalogPersistenceTest {
     var offer = get("/catalog/v1/offers/" + result.offerIds().getFirst(), 200);
     assertThat(offer.path("placeId").asText()).isEqualTo(result.placeId().toString());
     assertThat(offer.path("status").asText()).isEqualTo("ACTIVE");
+    assertThat(offer.path("placeRowVersion").isInt()).isTrue();
+    assertThat(offer.path("placeRowVersion").asInt()).isEqualTo(place.path("rowVersion").asInt());
     assertThat(
             offer
                 .path("payload")
