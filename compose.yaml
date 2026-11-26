@@ -7,7 +7,7 @@ services:
       POSTGRES_USER: catalog
       POSTGRES_PASSWORD: catalog
     ports:
-      - "127.0.0.1:5434:5432"
+      - "127.0.0.1:5436:5432"
     volumes:
       - catalog-data:/var/lib/postgresql/data
     healthcheck:
