@@ -181,16 +181,21 @@ public class CatalogRepository {
         Map.of("id", offerId, "payload", json.writeValueAsString(snapshot)));
   }
 
-  public JsonNode payload(UUID offerId) {
+  public record OfferSnapshot(Offer offer, Place place, JsonNode payload) {}
+
+  public Optional<OfferSnapshot> offerSnapshot(UUID offerId) {
+    var currentOffer = offer(offerId);
+    if (currentOffer.isEmpty()) return Optional.empty();
+    Offer offer = currentOffer.orElseThrow();
+    Place place = place(offer.placeId()).orElseThrow();
     ObjectNode snapshot =
         (ObjectNode)
             jdbc.queryForObject(
                 "SELECT payload::text FROM catalog_offer_snapshots WHERE offer_id=:id",
                 Map.of("id", offerId),
                 (rs, n) -> json.readTree(rs.getString(1)));
-    Offer offer = offer(offerId).orElseThrow();
-    snapshot.set("place", json.valueToTree(place(offer.placeId()).orElseThrow().data()));
-    return snapshot;
+    snapshot.set("place", json.valueToTree(place.data()));
+    return Optional.of(new OfferSnapshot(offer, place, snapshot));
   }
 
   private void replaceSchedule(UUID offerId, List<ScheduleInterval> schedule) {

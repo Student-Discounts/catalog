@@ -69,7 +69,7 @@ docker compose up -d --wait
 | `GET /openapi.json` | Спецификация публичного API |
 | `GET /catalog/v1/categories/{code}` | Внутренний: `code`, `name`, `sortOrder`, `isActive` |
 | `GET /catalog/v1/places/{id}` | Внутренний: место, `location.lat/lon`, `timezone`, `rowVersion` |
-| `GET /catalog/v1/offers/{id}` | Внутренний: `id`, `placeId`, `status`, `rowVersion`, полный `payload` |
+| `GET /catalog/v1/offers/{id}` | Внутренний: `id`, `placeId`, `status`, `rowVersion`, `placeRowVersion`, полный `payload` с местом той же ревизии |
 | `GET /actuator/health` | Проверка состояния без закрытых подробностей |
 
 Внутренние маршруты содержат `source.note` и ссылки на подтверждения: не публиковать их через Gateway. Submission вызывает их без bearer-токена; этот существующий контракт сохранён. Межсервисную защиту задаёт окружение, нельзя выдавать loopback-привязку за настроенную production-аутентификацию.

@@ -387,12 +387,14 @@ class CatalogPersistenceTest {
                 List.of(new Attachment(proofId, Attachment.Purpose.PROOF, 1)),
                 null,
                 null));
-    var payload = catalog.payload(result.offerIds().get(1));
+    var payload = catalog.offerSnapshot(result.offerIds().get(1)).orElseThrow().payload();
     assertThat(payload.path("attachments").get(0).path("mediaAssetId").asText())
         .isEqualTo(proofId.toString());
     assertThat(payload.path("attachments").get(0).path("offerIndex").asInt()).isZero();
-    assertThat(catalog.payload(result.offerIds().getFirst()).path("attachments").isEmpty())
-        .isTrue();
+    assertThat(
+            catalog.offerSnapshot(result.offerIds().getFirst()).orElseThrow().payload()
+                .path("attachments"))
+        .isEmpty();
   }
 
   @Test
@@ -457,7 +459,7 @@ class CatalogPersistenceTest {
 
   @Test
   void internalReadApiMatchesSubmissionConsumerFields() throws Exception {
-    var result = publications.publish(newPlace(1));
+    var result = publications.publish(newPlace(2));
     var category = get("/catalog/v1/categories/cafe", 200);
     assertThat(category.path("code").asText()).isEqualTo("cafe");
     assertThat(category.path("isActive").asBoolean()).isTrue();
@@ -468,6 +470,7 @@ class CatalogPersistenceTest {
     var offer = get("/catalog/v1/offers/" + result.offerIds().getFirst(), 200);
     assertThat(offer.path("placeId").asText()).isEqualTo(result.placeId().toString());
     assertThat(offer.path("status").asText()).isEqualTo("ACTIVE");
+    assertThat(offer.path("placeRowVersion")).isEqualTo(place.path("rowVersion"));
     assertThat(
             offer
                 .path("payload")
@@ -478,6 +481,23 @@ class CatalogPersistenceTest {
                 .path("timeUntil")
                 .asText())
         .isEqualTo("24:00");
+    var existing = catalog.place(result.placeId()).orElseThrow();
+    var renamed =
+        new PlaceData(
+            existing.id(),
+            "Новое название",
+            existing.city(),
+            existing.addressLine(),
+            existing.location(),
+            existing.categoryCode());
+    var secondOffer = offer("Правка").identified(result.offerIds().get(1));
+    publications.publish(
+        reviewed(ReviewedSubmission.Type.CHANGE, renamed, List.of(secondOffer), List.of(), 0, 0));
+    var refreshed = get("/catalog/v1/offers/" + result.offerIds().getFirst(), 200);
+    assertThat(refreshed.path("rowVersion")).isEqualTo(offer.path("rowVersion"));
+    assertThat(refreshed.path("placeRowVersion").asInt(-1)).isEqualTo(1);
+    assertThat(refreshed.path("payload").path("place").path("name").asText())
+        .isEqualTo(renamed.name());
     get("/catalog/v1/places/" + UUID.randomUUID(), 404);
     get("/catalog/v1/offers/not-a-uuid", 400);
   }
@@ -517,7 +537,7 @@ class CatalogPersistenceTest {
   void serializesRealContractExamplesWithoutNullSourceMembers() throws Exception {
     var command = newPlace(1);
     var result = publications.publish(command);
-    JsonNode payload = catalog.payload(result.offerIds().getFirst());
+    JsonNode payload = catalog.offerSnapshot(result.offerIds().getFirst()).orElseThrow().payload();
     assertThat(payload.path("offers").get(0).path("validFrom").asText()).isEqualTo("2026-11-01");
     CardSnapshot restored = json.treeToValue(payload, CardSnapshot.class);
     assertThat(restored.place().id()).isEqualTo(result.placeId());
